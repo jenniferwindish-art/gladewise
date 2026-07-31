@@ -1,250 +1,757 @@
-// Bladewise — seed data (realistic lawn care demo)
-import { db, initSchema, tableCount } from './db.mjs';
-import { optimizeRoute, routeDays, priceService, createEstimate, sendEstimate, updateAccountBalance } from './models.mjs';
+// Bladewise — data access functions
+import { db } from './db.mjs';
 import { randomUUID } from 'node:crypto';
 
-const tok = () => randomUUID().replace(/-/g, '').slice(0, 20);
+const mkToken = () => randomUUID().replace(/-/g, '').slice(0, 20);
 
-export function ensureSeed() {
-  initSchema();
-  if (tableCount('organizations') > 0) return;
-  seed();
+// Single-org demo: everything is scoped to org #1. Multi-tenant scoping is in
+// the schema (org_id on every root table) and becomes real when auth lands.
+export const ORG_ID = 1;
+
+export function getOrg() {
+  return db.prepare('SELECT * FROM organizations WHERE id = ?').get(ORG_ID);
 }
 
-function seed() {
-  const insert = (sql, ...p) => Number(db.prepare(sql).run(...p).lastInsertRowid);
+// ---- Dashboard metrics -----------------------------------------------------
+export function dashboardStats() {
+  const q = (sql, ...p) => db.prepare(sql).get(...p);
+  return {
+    activeAccounts: q("SELECT COUNT(*) n FROM accounts WHERE org_id=? AND status='active'", ORG_ID).n,
+    prospects: q("SELECT COUNT(*) n FROM accounts WHERE org_id=? AND status='prospect'", ORG_ID).n,
+    properties: q("SELECT COUNT(*) n FROM properties p JOIN accounts a ON a.id=p.account_id WHERE a.org_id=?", ORG_ID).n,
+    receivable: q("SELECT COALESCE(SUM(balance),0) s FROM accounts WHERE org_id=?", ORG_ID).s,
+    openInvoices: q("SELECT COUNT(*) n FROM invoices i JOIN accounts a ON a.id=i.account_id WHERE a.org_id=? AND i.status IN ('open','overdue')", ORG_ID).n,
+    subscriptions: q("SELECT COUNT(*) n FROM subscriptions s JOIN properties p ON p.id=s.property_id JOIN accounts a ON a.id=p.account_id WHERE a.org_id=? AND s.status='active'", ORG_ID).n,
+    followUps: q("SELECT COUNT(*) n FROM call_logs c JOIN accounts a ON a.id=c.account_id WHERE a.org_id=? AND c.follow_up_at IS NOT NULL AND date(c.follow_up_at) >= date('now')", ORG_ID).n,
+  };
+}
 
-  const orgId = insert(
-    `INSERT INTO organizations (name,phone,email,address,depot_lat,depot_lng) VALUES (?,?,?,?,?,?)`,
-    'Evergreen Lawn & Landscape', '(614) 555-0142', 'office@evergreenlawn.example', '48 Industrial Pkwy, Dublin, OH 43017',
-    40.0992, -83.1141);
-
-  // Users
-  const owner = insert(`INSERT INTO users (org_id,name,email,role) VALUES (?,?,?,?)`, orgId, 'Dana Reyes', 'dana@evergreenlawn.example', 'owner');
-  insert(`INSERT INTO users (org_id,name,email,role) VALUES (?,?,?,?)`, orgId, 'Priya Nair', 'priya@evergreenlawn.example', 'csr');
-
-  // Crews
-  const crewA = insert(`INSERT INTO crews (org_id,name,color) VALUES (?,?,?)`, orgId, 'Crew A — North', '#2f855a');
-  const crewB = insert(`INSERT INTO crews (org_id,name,color) VALUES (?,?,?)`, orgId, 'Crew B — South', '#2b6cb0');
-
-  // Service types / price book (area-tiered)
-  const stFert = insert(`INSERT INTO service_types (org_id,name,kind,rule_type,base_price,base_up_to_sqft,per_unit_price,unit_sqft,min_price)
-    VALUES (?,?,?,?,?,?,?,?,?)`, orgId, 'Fertilization + Weed Control', 'program', 'area_tier', 45, 5000, 6, 1000, 45);
-  const stGrub = insert(`INSERT INTO service_types (org_id,name,kind,rule_type,base_price,base_up_to_sqft,per_unit_price,unit_sqft,min_price)
-    VALUES (?,?,?,?,?,?,?,?,?)`, orgId, 'Grub Control', 'program', 'area_tier', 55, 5000, 7, 1000, 55);
-  const stAeration = insert(`INSERT INTO service_types (org_id,name,kind,rule_type,per_unit_price,unit_sqft,min_price)
-    VALUES (?,?,?,?,?,?,?)`, orgId, 'Aeration', 'onetime', 'per_unit', 15, 1000, 80);
-  insert(`INSERT INTO service_types (org_id,name,kind,rule_type,per_unit_price,unit_sqft,min_price)
-    VALUES (?,?,?,?,?,?,?)`, orgId, 'Overseeding', 'onetime', 'per_unit', 18, 1000, 90);
-  insert(`INSERT INTO service_types (org_id,name,kind,rule_type,flat_price)
-    VALUES (?,?,?,?,?)`, orgId, 'Shrub & Tree Treatment', 'onetime', 'flat', 65);
-
-  // Program + rounds
-  const prog = insert(`INSERT INTO service_programs (org_id,name,description) VALUES (?,?,?)`,
-    orgId, '7-Round Lawn Care Program', 'Full-season fertilization, weed & grub control — spring through fall.');
-  const rounds = [
-    ['Round 1 — Early Spring', stFert, '03-01', '04-15', 'Pre-emergent + slow-release N'],
-    ['Round 2 — Late Spring', stFert, '04-16', '05-31', 'Fertilizer + broadleaf weed control'],
-    ['Round 3 — Grub Control', stGrub, '06-01', '07-15', 'Season-long grub preventer'],
-    ['Round 4 — Summer', stFert, '07-16', '08-31', 'Slow-release summer feeding'],
-    ['Round 5 — Early Fall', stFert, '09-01', '10-10', 'Fertilizer + weed control'],
-    ['Round 6 — Late Fall', stFert, '10-11', '11-20', 'Winterizer'],
-    ['Round 7 — Lime', stFert, '11-01', '12-01', 'Soil pH balancing'],
-  ];
-  rounds.forEach((r, i) => insert(
-    `INSERT INTO program_rounds (program_id,seq,name,service_type_id,window_start,window_end,products) VALUES (?,?,?,?,?,?,?)`,
-    prog, i + 1, r[0], r[1], r[2], r[3], r[4]));
-
-  // ---- Customers ----------------------------------------------------------
-  // Coordinates cluster around Dublin / Powell / Hilliard OH (near the depot)
-  // so route optimization and the route map produce meaningful geography.
-  const customers = [
-    { name: 'John & Mary Smith', status: 'active', terms: 'installment', source: 'Referral', balance: 62.00,
-      addr: '124 Maple Avenue', city: 'Dublin', zip: '43017', turf: 6800, lat: 40.0995, lng: -83.1205,
-      contact: ['Mary Smith', '(614) 555-0111', 'mary.smith@example.com'], history: [] },
-    { name: 'Robert Chen', status: 'active', terms: 'prepay', source: 'Web form', balance: 0,
-      addr: '77 Riverside Drive', city: 'Powell', zip: '43065', turf: 11200, lat: 40.1585, lng: -83.0760,
-      contact: ['Robert Chen', '(614) 555-0122', 'rchen@example.com'], history: [] },
-    { name: 'Elena Petrova', status: 'active', terms: 'per_service', source: 'Neighbor campaign', balance: 148.50,
-      addr: '9 Birchwood Court', city: 'Dublin', zip: '43016', turf: 4200, lat: 40.1120, lng: -83.1580,
-      contact: ['Elena Petrova', '(614) 555-0133', 'elena.p@example.com'],
-      history: [['Aeration', 'Fall aeration', 'Marcus', '2025-09-30']] },
-    { name: 'The Garcia Family', status: 'active', terms: 'installment', source: 'Referral', balance: 0,
-      addr: '215 Oakhurst Lane', city: 'Hilliard', zip: '43026', turf: 8900, lat: 40.0335, lng: -83.1585,
-      contact: ['Luis Garcia', '(614) 555-0144', 'lgarcia@example.com'], history: [] },
-    { name: 'Sunset Ridge HOA', status: 'active', terms: 'installment', source: 'Commercial bid', balance: 940.00,
-      addr: '1 Sunset Ridge Blvd', city: 'Powell', zip: '43065', turf: 42000, lat: 40.1640, lng: -83.0685,
-      contact: ['Property Mgmt Office', '(614) 555-0155', 'mgmt@sunsetridge.example'], history: [] },
-    { name: 'Karen Whitfield', status: 'prospect', terms: 'per_service', source: 'Web form', balance: 0,
-      addr: '38 Coventry Place', city: 'Dublin', zip: '43017', turf: 5600, lat: 40.1050, lng: -83.1250,
-      contact: ['Karen Whitfield', '(614) 555-0166', 'kwhit@example.com'], history: [] },
-    { name: 'Tom Delgado', status: 'prospect', terms: 'per_service', source: 'Phone', balance: 0,
-      addr: '502 Windmill Road', city: 'Hilliard', zip: '43026', turf: 7300, lat: 40.0290, lng: -83.1660,
-      contact: ['Tom Delgado', '(614) 555-0177', 'tdelgado@example.com'], history: [] },
-    { name: 'Nguyen Residence', status: 'active', terms: 'prepay', source: 'Referral', balance: 0,
-      addr: '61 Cedar Hollow', city: 'Powell', zip: '43065', turf: 9800, lat: 40.1520, lng: -83.0840,
-      contact: ['Kim Nguyen', '(614) 555-0188', 'knguyen@example.com'],
-      history: [['Overseeding', 'Fall overseeding', 'Aisha', '2025-10-05']] },
-    { name: 'Frank & Susan Boyle', status: 'hold', terms: 'per_service', source: 'Referral', balance: 30.00,
-      addr: '140 Pinecrest Way', city: 'Dublin', zip: '43016', turf: 5100, lat: 40.1180, lng: -83.1520,
-      contact: ['Susan Boyle', '(614) 555-0199', 'sboyle@example.com'], history: [] },
-  ];
-
-  const propByName = {};
-  for (const c of customers) {
-    const acctId = insert(`INSERT INTO accounts (org_id,name,status,billing_address,terms,source,balance)
-      VALUES (?,?,?,?,?,?,?)`, orgId, c.name, c.status, `${c.addr}, ${c.city}, OH ${c.zip}`, c.terms, c.source, c.balance);
-    const propId = insert(`INSERT INTO properties (account_id,address,city,state,zip,lat,lng,turf_sqft,bed_sqft,lot_sqft,measure_method,measured_at,has_pets)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, acctId, c.addr, c.city, 'OH', c.zip, c.lat, c.lng, c.turf,
-      Math.round(c.turf * 0.12), Math.round(c.turf * 1.6), 'map_draw', '2026-03-01', c.name.includes('Garcia') ? 1 : 0);
-    insert(`INSERT INTO contacts (account_id,property_id,name,phone,email,is_primary,contact_pref)
-      VALUES (?,?,?,?,?,?,?)`, acctId, propId, c.contact[0], c.contact[1], c.contact[2], 1, 'phone');
-    c.propId = propId;
-    propByName[c.name] = propId;
-
-    // Active-program customers get a subscription + priced enrollment
-    if (c.status === 'active' && c.turf) {
-      const price = priceProgram(c.turf);
-      c.subId = insert(`INSERT INTO subscriptions (property_id,program_id,status,auto_renew,season_year,price)
-        VALUES (?,?,?,?,?,?)`, propId, prog, 'active', 1, 2026, price);
-    }
-    for (const h of c.history) {
-      insert(`INSERT INTO service_history (property_id,service_date,service_name,technician,products)
-        VALUES (?,?,?,?,?)`, propId, h[3], `${h[0]} — ${h[1]}`, h[2], '');
-    }
+// ---- Accounts --------------------------------------------------------------
+export function listAccounts({ status = null, q = null } = {}) {
+  let sql = `
+    SELECT a.*,
+      (SELECT COUNT(*) FROM properties p WHERE p.account_id=a.id) AS property_count,
+      (SELECT phone FROM contacts c WHERE c.account_id=a.id ORDER BY is_primary DESC LIMIT 1) AS phone
+    FROM accounts a WHERE a.org_id=@org`;
+  const params = { org: ORG_ID };
+  if (status) { sql += ' AND a.status=@status'; params.status = status; }
+  if (q) {
+    sql += ` AND (a.name LIKE @q OR EXISTS(
+      SELECT 1 FROM properties p WHERE p.account_id=a.id AND p.address LIKE @q) OR EXISTS(
+      SELECT 1 FROM contacts c WHERE c.account_id=a.id AND (c.phone LIKE @q OR c.email LIKE @q OR c.name LIKE @q)))`;
+    params.q = `%${q}%`;
   }
+  sql += ' ORDER BY a.name COLLATE NOCASE';
+  return db.prepare(sql).all(params);
+}
 
-  // ---- Materialize the season schedule (visits) from subscriptions --------
-  // Each active property gets a series of visits from the program rounds:
-  //   Rounds 1–3 → completed (with service history)
-  //   Round 4    → scheduled onto a shared route day (awaiting optimization)
-  //   Round 5    → unscheduled, surfaces in the "needs scheduling" panel
-  const roundRows = db.prepare('SELECT * FROM program_rounds WHERE program_id=? ORDER BY seq').all(prog);
-  const stName = new Map([[stFert, 'Fertilization + Weed Control'], [stGrub, 'Grub Control']]);
-  const stRows = new Map(db.prepare('SELECT * FROM service_types WHERE org_id=?').all(orgId).map(s => [s.id, s]));
-  const priceRound = (stId, turf) => { const st = stRows.get(stId); return st ? priceService(st, turf) : 0; };
-  const crewByCity = (city) => (city === 'Hilliard' ? crewB : crewA);
-  const techByCrew = (id) => (id === crewB ? 'Aisha' : 'Marcus');
-  const completedDate = { 1: '2026-03-20', 2: '2026-05-06', 3: '2026-06-25' };
-  const dueAfter = (d, n) => { const dt = new Date(d + 'T00:00:00'); dt.setDate(dt.getDate() + n); return dt.toISOString().slice(0, 10); };
-  const ROUTE_DAY = '2026-07-31'; // this week — a rich multi-stop day for Crew A
+export function getAccount(id) {
+  return db.prepare('SELECT * FROM accounts WHERE id=? AND org_id=?').get(id, ORG_ID);
+}
 
-  for (const c of customers.filter(x => x.subId)) {
-    const crewId = crewByCity(c.city);
-    c.completed = [];
-    for (const r of roundRows.filter(r => r.seq <= 5)) {
-      const svc = stName.get(r.service_type_id) || 'Service';
-      const wStart = `2026-${r.window_start}`, wEnd = `2026-${r.window_end}`;
-      const price = priceRound(r.service_type_id, c.turf);
-      if (r.seq <= 3) {
-        const d = completedDate[r.seq];
-        const vId = insert(`INSERT INTO visits (property_id,subscription_id,service_type_id,name,status,scheduled_date,window_start,window_end,crew_id,completed_at,price)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?)`, c.propId, c.subId, r.service_type_id, r.name, 'completed', d, wStart, wEnd, crewId, d, price);
-        insert(`INSERT INTO service_history (property_id,visit_id,service_date,service_name,technician,products)
-          VALUES (?,?,?,?,?,?)`, c.propId, vId, d, `${svc} — ${r.name}`, techByCrew(crewId), r.products);
-        c.completed.push({ seq: r.seq, vId, price, date: d, name: r.name });
-      } else if (r.seq === 4) {
-        insert(`INSERT INTO visits (property_id,subscription_id,service_type_id,name,status,scheduled_date,window_start,window_end,crew_id,price)
-          VALUES (?,?,?,?,?,?,?,?,?,?)`, c.propId, c.subId, r.service_type_id, r.name, 'scheduled', ROUTE_DAY, wStart, wEnd, crewId, price);
-      } else {
-        insert(`INSERT INTO visits (property_id,subscription_id,service_type_id,name,status,window_start,window_end,price)
-          VALUES (?,?,?,?,?,?,?,?)`, c.propId, c.subId, r.service_type_id, r.name, 'scheduled', wStart, wEnd, price);
+export function createAccount(data) {
+  const info = db.prepare(`INSERT INTO accounts (org_id,name,status,billing_address,terms,source,notes)
+    VALUES (@org,@name,@status,@billing_address,@terms,@source,@notes)`).run({
+      org: ORG_ID,
+      name: data.name,
+      status: data.status || 'prospect',
+      billing_address: data.billing_address || null,
+      terms: data.terms || 'per_service',
+      source: data.source || null,
+      notes: data.notes || null,
+    });
+  return Number(info.lastInsertRowid);
+}
+
+export function updateAccount(id, data) {
+  db.prepare(`UPDATE accounts SET name=@name, status=@status, billing_address=@billing_address,
+    terms=@terms, source=@source, notes=@notes WHERE id=@id AND org_id=@org`).run({
+      id, org: ORG_ID,
+      name: data.name, status: data.status,
+      billing_address: data.billing_address || null, terms: data.terms || 'per_service',
+      source: data.source || null, notes: data.notes || null,
+    });
+}
+
+// ---- Contacts --------------------------------------------------------------
+export function listContacts(accountId) {
+  return db.prepare('SELECT * FROM contacts WHERE account_id=? ORDER BY is_primary DESC, name').all(accountId);
+}
+
+export function createContact(accountId, data) {
+  const info = db.prepare(`INSERT INTO contacts (account_id,property_id,name,phone,email,is_primary,contact_pref)
+    VALUES (@account_id,@property_id,@name,@phone,@email,@is_primary,@contact_pref)`).run({
+      account_id: accountId,
+      property_id: data.property_id || null,
+      name: data.name, phone: data.phone || null, email: data.email || null,
+      is_primary: data.is_primary ? 1 : 0, contact_pref: data.contact_pref || 'phone',
+    });
+  return Number(info.lastInsertRowid);
+}
+
+// ---- Properties ------------------------------------------------------------
+export function listProperties(accountId) {
+  return db.prepare(`SELECT p.*,
+    (SELECT COUNT(*) FROM subscriptions s WHERE s.property_id=p.id AND s.status='active') AS active_subs
+    FROM properties p WHERE p.account_id=? ORDER BY p.address`).all(accountId);
+}
+
+export function getProperty(id) {
+  return db.prepare(`SELECT p.*, a.name AS account_name, a.org_id
+    FROM properties p JOIN accounts a ON a.id=p.account_id WHERE p.id=?`).get(id);
+}
+
+export function createProperty(accountId, data) {
+  const info = db.prepare(`INSERT INTO properties
+    (account_id,address,city,state,zip,turf_sqft,bed_sqft,lot_sqft,measure_method,measured_at,gate_code,has_pets,access_notes)
+    VALUES (@account_id,@address,@city,@state,@zip,@turf,@bed,@lot,@method,@measured,@gate,@pets,@access)`).run({
+      account_id: accountId,
+      address: data.address, city: data.city || null, state: data.state || null, zip: data.zip || null,
+      turf: intOrNull(data.turf_sqft), bed: intOrNull(data.bed_sqft), lot: intOrNull(data.lot_sqft),
+      method: data.turf_sqft ? (data.measure_method || 'manual') : null,
+      measured: data.turf_sqft ? new Date().toISOString().slice(0, 10) : null,
+      gate: data.gate_code || null, pets: data.has_pets ? 1 : 0, access: data.access_notes || null,
+    });
+  const pid = Number(info.lastInsertRowid);
+  if (data.turf_sqft) recordMeasurement(pid, data);
+  return pid;
+}
+
+export function updateMeasurement(propertyId, data) {
+  db.prepare(`UPDATE properties SET turf_sqft=@turf, bed_sqft=@bed, lot_sqft=@lot,
+    measure_method=@method, measured_at=@measured WHERE id=@id`).run({
+      id: propertyId,
+      turf: intOrNull(data.turf_sqft), bed: intOrNull(data.bed_sqft), lot: intOrNull(data.lot_sqft),
+      method: data.measure_method || 'manual', measured: new Date().toISOString().slice(0, 10),
+    });
+  recordMeasurement(propertyId, data);
+}
+
+function recordMeasurement(propertyId, data) {
+  db.prepare(`INSERT INTO measurements (property_id,turf_sqft,bed_sqft,lot_sqft,method)
+    VALUES (?,?,?,?,?)`).run(propertyId, intOrNull(data.turf_sqft), intOrNull(data.bed_sqft),
+      intOrNull(data.lot_sqft), data.measure_method || 'manual');
+}
+
+export function propertyHistory(propertyId) {
+  return db.prepare('SELECT * FROM service_history WHERE property_id=? ORDER BY service_date DESC').all(propertyId);
+}
+
+export function propertySubscriptions(propertyId) {
+  return db.prepare(`SELECT s.*, sp.name AS program_name
+    FROM subscriptions s JOIN service_programs sp ON sp.id=s.program_id
+    WHERE s.property_id=? ORDER BY s.season_year DESC`).all(propertyId);
+}
+
+// ---- Call log --------------------------------------------------------------
+export function listCalls(accountId) {
+  return db.prepare(`SELECT c.*, u.name AS user_name FROM call_logs c
+    LEFT JOIN users u ON u.id=c.user_id WHERE c.account_id=? ORDER BY c.created_at DESC`).all(accountId);
+}
+
+export function createCall(accountId, data) {
+  db.prepare('INSERT INTO call_logs (account_id,user_id,note,follow_up_at) VALUES (?,?,?,?)')
+    .run(accountId, data.user_id || null, data.note, data.follow_up_at || null);
+}
+
+// ---- Account financials snapshot ------------------------------------------
+export function accountInvoices(accountId) {
+  return db.prepare('SELECT * FROM invoices WHERE account_id=? ORDER BY created_at DESC').all(accountId);
+}
+
+// ---- Unified search --------------------------------------------------------
+export function search(term) {
+  const like = `%${term}%`;
+  const accounts = db.prepare(`SELECT id,name,status FROM accounts
+    WHERE org_id=@org AND name LIKE @q ORDER BY name LIMIT 8`).all({ org: ORG_ID, q: like });
+  const properties = db.prepare(`SELECT p.id,p.address,p.city,p.account_id,a.name AS account_name
+    FROM properties p JOIN accounts a ON a.id=p.account_id
+    WHERE a.org_id=@org AND (p.address LIKE @q OR p.zip LIKE @q) ORDER BY p.address LIMIT 8`)
+    .all({ org: ORG_ID, q: like });
+  const contacts = db.prepare(`SELECT c.id,c.name,c.phone,c.email,c.account_id,a.name AS account_name
+    FROM contacts c JOIN accounts a ON a.id=c.account_id
+    WHERE a.org_id=@org AND (c.name LIKE @q OR c.phone LIKE @q OR c.email LIKE @q) ORDER BY c.name LIMIT 8`)
+    .all({ org: ORG_ID, q: like });
+  return { accounts, properties, contacts };
+}
+
+// ---- Pricing engine (used by estimates; available now for property pages) --
+export function priceService(serviceType, turfSqft) {
+  const sqft = turfSqft || 0;
+  let price = 0;
+  if (serviceType.rule_type === 'flat') {
+    price = serviceType.flat_price;
+  } else if (serviceType.rule_type === 'per_unit') {
+    price = (sqft / (serviceType.unit_sqft || 1000)) * serviceType.per_unit_price;
+  } else { // area_tier
+    price = serviceType.base_price;
+    const extra = Math.max(0, sqft - (serviceType.base_up_to_sqft || 0));
+    if (extra > 0) price += Math.ceil(extra / (serviceType.unit_sqft || 1000)) * serviceType.per_unit_price;
+  }
+  return Math.max(price, serviceType.min_price || 0);
+}
+
+export function listServiceTypes() {
+  return db.prepare('SELECT * FROM service_types WHERE org_id=? ORDER BY kind DESC, name').all(ORG_ID);
+}
+
+export function listPrograms() {
+  return db.prepare('SELECT * FROM service_programs WHERE org_id=? ORDER BY name').all(ORG_ID);
+}
+
+function intOrNull(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = parseInt(String(v).replace(/[^0-9]/g, ''), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+// ===========================================================================
+// PHASE 2 — Scheduling & routing
+// ===========================================================================
+
+export function todayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+export function addDays(iso, n) {
+  const d = new Date(iso + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+// Monday of the week containing `iso`
+export function weekStart(iso) {
+  const d = new Date((iso || todayISO()) + 'T00:00:00');
+  const dow = (d.getDay() + 6) % 7; // 0 = Monday
+  d.setDate(d.getDate() - dow);
+  return d.toISOString().slice(0, 10);
+}
+
+export function listCrews() {
+  return db.prepare('SELECT * FROM crews WHERE org_id=? ORDER BY name').all(ORG_ID);
+}
+export function getCrew(id) {
+  return db.prepare('SELECT * FROM crews WHERE id=?').get(id);
+}
+export function getDepot() {
+  const o = getOrg();
+  return { lat: o.depot_lat, lng: o.depot_lng, name: o.name, address: o.address };
+}
+
+// Rich visit row with property + account + crew
+function visitSelect(where) {
+  return `SELECT v.*, p.address, p.city, p.state, p.zip, p.lat, p.lng, p.turf_sqft,
+      p.access_notes, p.gate_code, p.has_pets,
+      a.id AS account_id, a.name AS account_name,
+      cr.name AS crew_name, cr.color AS crew_color
+    FROM visits v
+    JOIN properties p ON p.id=v.property_id
+    JOIN accounts a ON a.id=p.account_id
+    LEFT JOIN crews cr ON cr.id=v.crew_id
+    WHERE a.org_id=@org ${where}`;
+}
+
+export function getVisit(id) {
+  return db.prepare(visitSelect('AND v.id=@id')).get({ org: ORG_ID, id });
+}
+
+export function visitsBetween(start, end) {
+  return db.prepare(visitSelect('AND v.scheduled_date >= @start AND v.scheduled_date <= @end')
+    + ' ORDER BY v.scheduled_date, v.crew_id, COALESCE(v.seq, 999), a.name')
+    .all({ org: ORG_ID, start, end });
+}
+
+// The scheduling board: 7 days from weekStart, each with its visits
+export function scheduleWeek(anchorISO) {
+  const start = weekStart(anchorISO);
+  const end = addDays(start, 6);
+  const visits = visitsBetween(start, end);
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const date = addDays(start, i);
+    days.push({ date, visits: visits.filter(v => v.scheduled_date === date) });
+  }
+  return { start, end, prev: addDays(start, -7), next: addDays(start, 7), days };
+}
+
+// Visits that still need a date (scheduled, no scheduled_date), coming due
+export function needsScheduling(withinDays = 60) {
+  const horizon = addDays(todayISO(), withinDays);
+  return db.prepare(visitSelect(
+    "AND v.status='scheduled' AND v.scheduled_date IS NULL AND v.window_start <= @horizon")
+    + ' ORDER BY v.window_start, a.name')
+    .all({ org: ORG_ID, horizon });
+}
+
+export function assignVisit(id, { scheduled_date, crew_id }) {
+  db.prepare('UPDATE visits SET scheduled_date=?, crew_id=?, status=?, seq=NULL WHERE id=?')
+    .run(scheduled_date || null, crew_id ? Number(crew_id) : null,
+      scheduled_date ? 'scheduled' : 'scheduled', id);
+}
+
+// ---- Routing ---------------------------------------------------------------
+export function haversineMiles(aLat, aLng, bLat, bLng) {
+  const R = 3958.8, toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(bLat - aLat), dLng = toRad(bLng - aLng);
+  const s = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+// Stops assigned to a crew on a date (in stored seq order)
+export function routeStops(crewId, date) {
+  return db.prepare(visitSelect('AND v.crew_id=@crew AND v.scheduled_date=@date')
+    + ' ORDER BY COALESCE(v.seq, 999), a.name')
+    .all({ org: ORG_ID, crew: Number(crewId), date });
+}
+
+function routeDistance(order, depot) {
+  if (!order.length) return 0;
+  let d = dist(depot, order[0]);
+  for (let i = 0; i < order.length - 1; i++) d += dist(order[i], order[i + 1]);
+  d += dist(order[order.length - 1], depot); // return to depot
+  return d;
+}
+function dist(a, b) { return haversineMiles(a.lat, a.lng, b.lat, b.lng); }
+
+// Nearest-neighbour construction + 2-opt improvement, starting/ending at depot
+export function optimizeOrder(stops, depot) {
+  const withGeo = stops.filter(s => s.lat != null && s.lng != null);
+  const noGeo = stops.filter(s => s.lat == null || s.lng == null);
+  if (withGeo.length <= 1) return [...withGeo, ...noGeo];
+
+  // Nearest neighbour
+  const remaining = [...withGeo];
+  const order = [];
+  let cur = depot;
+  while (remaining.length) {
+    let bi = 0, bd = Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const d = dist(cur, remaining[i]);
+      if (d < bd) { bd = d; bi = i; }
+    }
+    cur = remaining[bi];
+    order.push(cur);
+    remaining.splice(bi, 1);
+  }
+  // 2-opt
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let i = 0; i < order.length - 1; i++) {
+      for (let j = i + 1; j < order.length; j++) {
+        const cand = order.slice(0, i).concat(order.slice(i, j + 1).reverse(), order.slice(j + 1));
+        if (routeDistance(cand, depot) + 1e-9 < routeDistance(order, depot)) {
+          order.splice(0, order.length, ...cand);
+          improved = true;
+        }
       }
     }
   }
+  return [...order, ...noGeo];
+}
 
-  // ---- Invoices generated from completed visits (paid history + open AR) ----
-  // Rounds 1 & 2 are paid; round 3 is left open/overdue for some accounts.
-  const mkInvoice = (acctId, terms, visits, { paid }) => {
-    const subtotal = Math.round(visits.reduce((s, v) => s + v.price, 0) * 100) / 100;
-    const issued = visits[0].date, due = dueAfter(issued, 15);
-    const status = paid ? 'paid' : (due < '2026-07-30' ? 'overdue' : 'open');
-    const invId = insert(`INSERT INTO invoices (account_id,status,subtotal,amount_paid,terms,token,issued_date,due_date)
-      VALUES (?,?,?,?,?,?,?,?)`, acctId, status, subtotal, paid ? subtotal : 0, terms, tok(), issued, due);
-    for (const v of visits) {
-      insert(`INSERT INTO invoice_lines (invoice_id,visit_id,description,amount) VALUES (?,?,?,?)`, invId, v.vId, v.name, v.price);
-      db.prepare('UPDATE visits SET invoice_id=? WHERE id=?').run(invId, v.vId);
-    }
-    if (paid) insert(`INSERT INTO payments (account_id,amount,method,applied_at) VALUES (?,?,?,?)`, acctId, subtotal, 'card', dueAfter(issued, 5));
-    return invId;
+export function optimizeRoute(crewId, date) {
+  const stops = routeStops(crewId, date);
+  const ordered = optimizeOrder(stops, getDepot());
+  const tx = db.prepare('UPDATE visits SET seq=? WHERE id=?');
+  ordered.forEach((s, i) => tx.run(i + 1, s.id));
+  return ordered.length;
+}
+
+export function moveStop(id, dir) {
+  const v = getVisit(id);
+  if (!v || !v.scheduled_date || !v.crew_id) return;
+  const stops = routeStops(v.crew_id, v.scheduled_date);
+  const idx = stops.findIndex(s => s.id === id);
+  const swap = dir === 'up' ? idx - 1 : idx + 1;
+  if (idx < 0 || swap < 0 || swap >= stops.length) return;
+  const a = stops[idx], b = stops[swap];
+  const tx = db.prepare('UPDATE visits SET seq=? WHERE id=?');
+  // ensure both have seq values
+  const aSeq = a.seq || idx + 1, bSeq = b.seq || swap + 1;
+  tx.run(bSeq, a.id);
+  tx.run(aSeq, b.id);
+}
+
+// Distance / time estimate for an ordered stop list
+export function routeStats(stops, depot, { mph = 28, serviceMin = 25 } = {}) {
+  const geo = stops.filter(s => s.lat != null && s.lng != null);
+  const miles = routeDistance(geo, depot);
+  const driveMin = (miles / mph) * 60;
+  const serviceTotal = stops.length * serviceMin;
+  return {
+    stops: stops.length,
+    miles: Math.round(miles * 10) / 10,
+    driveMin: Math.round(driveMin),
+    serviceMin: serviceTotal,
+    totalMin: Math.round(driveMin + serviceTotal),
   };
-
-  let idx = 0;
-  for (const c of customers.filter(x => x.subId)) {
-    const acctId = db.prepare('SELECT account_id FROM properties WHERE id=?').get(c.propId).account_id;
-    const r1 = c.completed.find(v => v.seq === 1), r2 = c.completed.find(v => v.seq === 2), r3 = c.completed.find(v => v.seq === 3);
-    if (r1) mkInvoice(acctId, c.terms, [r1], { paid: true });
-    if (r2) mkInvoice(acctId, c.terms, [r2], { paid: true });
-    if (r3) mkInvoice(acctId, c.terms, [r3], { paid: idx % 2 === 1 }); // alternate: some open/overdue
-    idx++;
-  }
-  // Recompute every account's balance from its invoices (consistency)
-  for (const row of db.prepare('SELECT id FROM accounts WHERE org_id=?').all(orgId)) updateAccountBalance(row.id);
-
-  // Payment methods on file for prepay / installment customers (autopay on)
-  for (const c of customers.filter(x => x.subId && (x.terms === 'prepay' || x.terms === 'installment'))) {
-    const acctId = db.prepare('SELECT account_id FROM properties WHERE id=?').get(c.propId).account_id;
-    insert(`INSERT INTO payment_methods (account_id,brand,last4,token,autopay) VALUES (?,?,?,?,?)`,
-      acctId, 'Visa', String(4000 + (acctId * 7) % 6000).slice(-4), tok(), 1);
-  }
-
-  // Sample estimates: one sent (awaiting approval), one draft
-  const est1 = createEstimate(propByName['Karen Whitfield'], { program: true });
-  if (est1) sendEstimate(est1);
-  createEstimate(propByName['Tom Delgado'], { program: true, serviceTypeIds: [stAeration] });
-
-  // A couple of call-log entries with a follow-up
-  const smith = db.prepare("SELECT id FROM accounts WHERE name LIKE 'John & Mary%'").get().id;
-  const karen = db.prepare("SELECT id FROM accounts WHERE name LIKE 'Karen%'").get().id;
-  insert(`INSERT INTO call_logs (account_id,user_id,note,follow_up_at) VALUES (?,?,?,?)`,
-    smith, owner, 'Mary called to add grub control to this year’s program. Confirmed pricing, will update subscription.', null);
-  insert(`INSERT INTO call_logs (account_id,user_id,note,follow_up_at) VALUES (?,?,?,?)`,
-    karen, owner, 'Requested an estimate for the full 7-round program. Sent — awaiting approval.', isoInDays(3));
-
-  // ---- Activity feed: backdated notifications from historical events -------
-  const notif = (acctId, type, channel, title, body, at) => insert(
-    `INSERT INTO notifications (org_id,account_id,type,channel,title,body,created_at) VALUES (?,?,?,?,?,?,?)`,
-    orgId, acctId, type, channel, title, body, at);
-  for (const p of db.prepare(`SELECT pay.amount, pay.applied_at, a.id acct, a.name FROM payments pay
-      JOIN accounts a ON a.id=pay.account_id WHERE a.org_id=?`).all(orgId)) {
-    notif(p.acct, 'payment_received', 'email', `Payment received — ${p.name}`, `$${p.amount.toFixed(2)} paid by card.`, p.applied_at + ' 09:12:00');
-  }
-  for (const c of db.prepare(`SELECT v.name, v.completed_at, a.id acct, a.name aname, pr.address FROM visits v
-      JOIN properties pr ON pr.id=v.property_id JOIN accounts a ON a.id=pr.account_id
-      WHERE a.org_id=? AND v.status='completed' AND v.completed_at >= '2026-06-01'`).all(orgId)) {
-    notif(c.acct, 'service_complete', 'sms', `Service completed — ${c.aname}`, `${c.name} at ${c.address}. Customer texted.`, c.completed_at + ' 14:30:00');
-  }
-
-  // Pre-optimize the seeded route days so the map & board look polished on first run
-  for (const rd of routeDays()) optimizeRoute(rd.crew_id, rd.date);
-
-  console.log('Seeded demo data: Evergreen Lawn & Landscape with', customers.length, 'customers.');
 }
 
-// Program price = sum of the recurring rounds priced against turf
-function priceProgram(turf) {
-  // 6 fertilization rounds + 1 grub round, area-tiered — approximate the engine
-  const fert = 45 + Math.max(0, Math.ceil((turf - 5000) / 1000)) * 6;
-  const grub = 55 + Math.max(0, Math.ceil((turf - 5000) / 1000)) * 7;
-  return Math.round((fert * 6 + grub) * 100) / 100;
+// Distinct upcoming crew-days that have stops (for the routes index)
+export function routeDays() {
+  return db.prepare(`SELECT v.scheduled_date AS date, v.crew_id, cr.name AS crew_name, cr.color AS crew_color,
+      COUNT(*) AS stops
+    FROM visits v JOIN properties p ON p.id=v.property_id JOIN accounts a ON a.id=p.account_id
+    JOIN crews cr ON cr.id=v.crew_id
+    WHERE a.org_id=@org AND v.scheduled_date IS NOT NULL AND v.status IN ('scheduled','assigned','in_progress')
+    GROUP BY v.scheduled_date, v.crew_id
+    ORDER BY v.scheduled_date, cr.name`).all({ org: ORG_ID });
 }
 
-function isoInDays(d) {
-  const dt = new Date();
-  dt.setDate(dt.getDate() + d);
-  return dt.toISOString().slice(0, 10);
+export function completeVisit(id, data = {}) {
+  const v = getVisit(id);
+  if (!v) return;
+  const now = todayISO();
+  db.prepare("UPDATE visits SET status='completed', completed_at=? WHERE id=?").run(now, id);
+  db.prepare(`INSERT INTO service_history (property_id,visit_id,service_date,service_name,technician,products,notes)
+    VALUES (?,?,?,?,?,?,?)`).run(v.property_id, id, now, v.name || 'Service',
+      data.technician || v.crew_name || null, data.products || null, data.notes || null);
+  notify('service_complete', { accountId: v.account_id, channel: 'sms',
+    title: `Service completed — ${v.account_name}`, body: `${v.name || 'Service'} at ${v.address}. Customer notified by text.` });
 }
 
-// CLI: `node src/seed.mjs [--reset]`
-if (import.meta.url === `file://${process.argv[1]}`) {
-  if (process.argv.includes('--reset')) {
-    const tables = ['call_logs', 'payment_methods', 'payments', 'invoice_lines', 'invoices', 'service_history',
-      'visits', 'estimate_lines', 'estimates', 'subscriptions', 'program_rounds', 'service_programs',
-      'service_types', 'measurements', 'contacts', 'properties', 'accounts', 'crews', 'users', 'organizations'];
-    initSchema();
-    for (const t of tables) { try { db.exec(`DELETE FROM ${t}`); } catch {} }
-    console.log('Cleared existing data.');
+export function scheduleStats() {
+  const q = (sql, ...p) => db.prepare(sql).get(...p);
+  return {
+    needs: q(`SELECT COUNT(*) n FROM visits v JOIN properties p ON p.id=v.property_id JOIN accounts a ON a.id=p.account_id
+      WHERE a.org_id=? AND v.status='scheduled' AND v.scheduled_date IS NULL`, ORG_ID).n,
+    scheduled: q(`SELECT COUNT(*) n FROM visits v JOIN properties p ON p.id=v.property_id JOIN accounts a ON a.id=p.account_id
+      WHERE a.org_id=? AND v.scheduled_date IS NOT NULL AND v.status!='completed'`, ORG_ID).n,
+    completed: q(`SELECT COUNT(*) n FROM visits v JOIN properties p ON p.id=v.property_id JOIN accounts a ON a.id=p.account_id
+      WHERE a.org_id=? AND v.status='completed'`, ORG_ID).n,
+  };
+}
+
+// ===========================================================================
+// PHASE 3 — Estimates, invoicing & payments
+// ===========================================================================
+const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+const currentYear = () => new Date().getFullYear();
+
+export function getServiceType(id) {
+  return db.prepare('SELECT * FROM service_types WHERE id=?').get(id);
+}
+export function getProgram() {
+  return db.prepare('SELECT * FROM service_programs WHERE org_id=? ORDER BY id LIMIT 1').get(ORG_ID);
+}
+export function programRounds(programId) {
+  return db.prepare('SELECT * FROM program_rounds WHERE program_id=? ORDER BY seq').all(programId);
+}
+// Program price = sum of its rounds priced against the property's turf
+export function priceProgram(programId, turf) {
+  const rounds = programRounds(programId);
+  let total = 0; const lines = [];
+  for (const r of rounds) {
+    const st = getServiceType(r.service_type_id);
+    const p = st ? priceService(st, turf) : 0;
+    total += p; lines.push({ name: r.name, price: p });
   }
-  ensureSeed();
-  console.log('Done.');
+  return { total: round2(total), lines };
+}
+
+// ---- Estimates -------------------------------------------------------------
+function estimateSelect(where) {
+  return `SELECT e.*, p.address, p.city, p.turf_sqft, p.account_id,
+      a.name AS account_name, a.status AS account_status
+    FROM estimates e
+    JOIN properties p ON p.id=e.property_id
+    JOIN accounts a ON a.id=p.account_id
+    WHERE a.org_id=@org ${where}`;
+}
+export function listEstimates(status = null) {
+  if (status) return db.prepare(estimateSelect('AND e.status=@status') + ' ORDER BY e.created_at DESC').all({ org: ORG_ID, status });
+  return db.prepare(estimateSelect('') + ' ORDER BY e.created_at DESC').all({ org: ORG_ID });
+}
+export function getEstimate(id) {
+  return db.prepare(estimateSelect('AND e.id=@id')).get({ org: ORG_ID, id });
+}
+export function getEstimateByToken(tok) {
+  return db.prepare(estimateSelect('AND e.token=@t')).get({ org: ORG_ID, t: tok });
+}
+export function estimateLines(id) {
+  return db.prepare('SELECT * FROM estimate_lines WHERE estimate_id=? ORDER BY id').all(id);
+}
+export function openEstimateForProperty(propertyId) {
+  return db.prepare("SELECT * FROM estimates WHERE property_id=? AND status IN ('draft','sent') ORDER BY created_at DESC LIMIT 1").get(propertyId);
+}
+export function estimateStats() {
+  const q = (s) => db.prepare(s).get(ORG_ID).n;
+  const base = `SELECT COUNT(*) n FROM estimates e JOIN properties p ON p.id=e.property_id JOIN accounts a ON a.id=p.account_id WHERE a.org_id=?`;
+  return {
+    draft: q(base + " AND e.status='draft'"),
+    sent: q(base + " AND e.status='sent'"),
+    approved: q(base + " AND e.status='approved'"),
+  };
+}
+
+export function createEstimate(propertyId, { program = false, serviceTypeIds = [] }) {
+  const prop = getProperty(propertyId);
+  if (!prop) return null;
+  const turf = prop.turf_sqft || 0;
+  const estId = Number(db.prepare("INSERT INTO estimates (property_id,status,subtotal,token) VALUES (?,?,?,?)")
+    .run(propertyId, 'draft', 0, mkToken()).lastInsertRowid);
+  let subtotal = 0;
+  if (program) {
+    const prog = getProgram();
+    const pp = priceProgram(prog.id, turf);
+    db.prepare('INSERT INTO estimate_lines (estimate_id,program_id,description,sqft,price) VALUES (?,?,?,?,?)')
+      .run(estId, prog.id, prog.name, turf, pp.total);
+    subtotal += pp.total;
+  }
+  for (const stId of serviceTypeIds) {
+    const st = getServiceType(Number(stId));
+    if (!st) continue;
+    const p = priceService(st, turf);
+    db.prepare('INSERT INTO estimate_lines (estimate_id,service_type_id,description,sqft,price) VALUES (?,?,?,?,?)')
+      .run(estId, st.id, st.name, turf, p);
+    subtotal += p;
+  }
+  db.prepare('UPDATE estimates SET subtotal=? WHERE id=?').run(round2(subtotal), estId);
+  return estId;
+}
+
+export function sendEstimate(id) {
+  const e = getEstimate(id);
+  if (!e) return;
+  db.prepare("UPDATE estimates SET status='sent', token=COALESCE(token,?) WHERE id=?").run(mkToken(), id);
+  notify('estimate_sent', { accountId: e.account_id, channel: 'email',
+    title: `Estimate sent to ${e.account_name}`, body: `${usd(e.subtotal)} estimate emailed with an approval link.` });
+}
+export function declineEstimate(id) {
+  db.prepare("UPDATE estimates SET status='declined' WHERE id=?").run(id);
+}
+
+// Approve → convert lines into subscriptions (program) and visits (one-time)
+export function approveEstimate(id) {
+  const e = getEstimate(id);
+  if (!e || e.status === 'approved') return;
+  db.prepare("UPDATE estimates SET status='approved' WHERE id=?").run(id);
+  db.prepare("UPDATE accounts SET status='active' WHERE id=? AND status='prospect'").run(e.account_id);
+  notify('estimate_approved', { accountId: e.account_id, channel: 'internal',
+    title: `${e.account_name} approved estimate #${id}`, body: `${usd(e.subtotal)} — converted to a subscription and scheduled.` });
+  const prop = getProperty(e.property_id);
+  for (const l of estimateLines(id)) {
+    if (l.program_id) {
+      const subId = Number(db.prepare(`INSERT INTO subscriptions (property_id,program_id,status,auto_renew,season_year,price)
+        VALUES (?,?,?,?,?,?)`).run(e.property_id, l.program_id, 'active', 1, currentYear(), l.price).lastInsertRowid);
+      materializeVisits(subId);
+    } else if (l.service_type_id) {
+      db.prepare(`INSERT INTO visits (property_id,service_type_id,name,status,price) VALUES (?,?,?,?,?)`)
+        .run(e.property_id, l.service_type_id, l.description, 'scheduled', l.price);
+    }
+  }
+}
+
+// Create the season's visits for a subscription (unscheduled → needs scheduling)
+export function materializeVisits(subscriptionId) {
+  const sub = db.prepare('SELECT * FROM subscriptions WHERE id=?').get(subscriptionId);
+  if (!sub) return;
+  const prop = getProperty(sub.property_id);
+  const turf = prop?.turf_sqft || 0;
+  const yr = sub.season_year || currentYear();
+  for (const r of programRounds(sub.program_id)) {
+    const st = getServiceType(r.service_type_id);
+    const price = st ? priceService(st, turf) : 0;
+    db.prepare(`INSERT INTO visits (property_id,subscription_id,service_type_id,name,status,window_start,window_end,price)
+      VALUES (?,?,?,?,?,?,?,?)`).run(sub.property_id, subscriptionId, r.service_type_id, r.name, 'scheduled',
+        `${yr}-${r.window_start}`, `${yr}-${r.window_end}`, price);
+  }
+}
+
+// ---- Invoicing -------------------------------------------------------------
+export function refreshOverdue() {
+  db.prepare("UPDATE invoices SET status='overdue' WHERE status='open' AND due_date < ?").run(todayISO());
+}
+
+function invoiceSelect(where) {
+  return `SELECT i.*, a.name AS account_name, a.terms AS account_terms,
+      (i.subtotal - i.amount_paid) AS balance
+    FROM invoices i JOIN accounts a ON a.id=i.account_id
+    WHERE a.org_id=@org ${where}`;
+}
+export function listInvoices(status = null) {
+  refreshOverdue();
+  if (status) return db.prepare(invoiceSelect('AND i.status=@status') + ' ORDER BY i.created_at DESC, i.id DESC').all({ org: ORG_ID, status });
+  return db.prepare(invoiceSelect('') + ' ORDER BY i.created_at DESC, i.id DESC').all({ org: ORG_ID });
+}
+export function getInvoice(id) {
+  return db.prepare(invoiceSelect('AND i.id=@id')).get({ org: ORG_ID, id });
+}
+export function getInvoiceByToken(tok) {
+  return db.prepare(invoiceSelect('AND i.token=@t')).get({ org: ORG_ID, t: tok });
+}
+export function invoiceLines(id) {
+  return db.prepare('SELECT * FROM invoice_lines WHERE invoice_id=? ORDER BY id').all(id);
+}
+
+// Generate invoices from completed, not-yet-billed visits (bundled per account)
+export function generateInvoices() {
+  const rows = db.prepare(`SELECT v.id, v.name, v.price, v.completed_at, p.account_id, p.address
+    FROM visits v JOIN properties p ON p.id=v.property_id JOIN accounts a ON a.id=p.account_id
+    WHERE a.org_id=? AND v.status='completed' AND v.invoice_id IS NULL AND v.price > 0`).all(ORG_ID);
+  const byAcct = new Map();
+  for (const r of rows) { if (!byAcct.has(r.account_id)) byAcct.set(r.account_id, []); byAcct.get(r.account_id).push(r); }
+  let created = 0;
+  const issued = todayISO(), due = addDays(issued, 15);
+  for (const [acctId, visits] of byAcct) {
+    const acct = getAccount(acctId);
+    const subtotal = round2(visits.reduce((s, v) => s + v.price, 0));
+    const invId = Number(db.prepare(`INSERT INTO invoices (account_id,status,subtotal,amount_paid,terms,token,issued_date,due_date)
+      VALUES (?,?,?,?,?,?,?,?)`).run(acctId, 'open', subtotal, 0, acct.terms, mkToken(), issued, due).lastInsertRowid);
+    for (const v of visits) {
+      db.prepare('INSERT INTO invoice_lines (invoice_id,visit_id,description,amount) VALUES (?,?,?,?)')
+        .run(invId, v.id, `${v.name} — ${v.address}`, v.price);
+      db.prepare("UPDATE visits SET invoice_id=? WHERE id=?").run(invId, v.id);
+    }
+    updateAccountBalance(acctId);
+    notify('invoice_sent', { accountId: acctId, channel: 'email',
+      title: `Invoice #${invId} sent to ${acct.name}`, body: `${usd(subtotal)} due ${due}.` });
+    created++;
+  }
+  return created;
+}
+
+export function recordPayment(invoiceId, { amount, method = 'card' } = {}) {
+  const inv = getInvoice(invoiceId);
+  if (!inv) return;
+  const bal = inv.subtotal - inv.amount_paid;
+  const amt = amount ? Math.min(parseFloat(amount), bal) : bal;
+  if (!(amt > 0)) return;
+  db.prepare('INSERT INTO payments (account_id,amount,method) VALUES (?,?,?)').run(inv.account_id, amt, method);
+  const paid = round2(inv.amount_paid + amt);
+  const status = paid + 1e-6 >= inv.subtotal ? 'paid' : 'open';
+  db.prepare('UPDATE invoices SET amount_paid=?, status=? WHERE id=?').run(paid, status, invoiceId);
+  updateAccountBalance(inv.account_id);
+  notify('payment_received', { accountId: inv.account_id, channel: 'email',
+    title: `Payment received — ${inv.account_name}`, body: `${usd(amt)} applied to invoice #${invoiceId} (${method}).` });
+}
+
+export function updateAccountBalance(accountId) {
+  const bal = db.prepare(`SELECT COALESCE(SUM(subtotal-amount_paid),0) b FROM invoices
+    WHERE account_id=? AND status IN ('open','overdue')`).get(accountId).b;
+  db.prepare('UPDATE accounts SET balance=? WHERE id=?').run(round2(bal), accountId);
+}
+
+// Autopay: charge open/overdue invoices for accounts with an autopay method
+export function runAutopay() {
+  refreshOverdue();
+  const rows = db.prepare(`SELECT DISTINCT i.id FROM invoices i
+    JOIN accounts a ON a.id=i.account_id
+    JOIN payment_methods pm ON pm.account_id=a.id AND pm.autopay=1
+    WHERE a.org_id=? AND i.status IN ('open','overdue')`).all(ORG_ID);
+  let n = 0, total = 0;
+  for (const r of rows) {
+    const inv = getInvoice(r.id);
+    const bal = inv.subtotal - inv.amount_paid;
+    if (bal > 0) { recordPayment(r.id, { amount: bal, method: 'autopay' }); n++; total += bal; }
+  }
+  return { count: n, total: round2(total) };
+}
+
+export function invoiceStats() {
+  refreshOverdue();
+  const q = (s) => db.prepare(s).get(ORG_ID);
+  const b = `FROM invoices i JOIN accounts a ON a.id=i.account_id WHERE a.org_id=?`;
+  return {
+    ar: round2(q(`SELECT COALESCE(SUM(subtotal-amount_paid),0) v ${b} AND i.status IN ('open','overdue')`).v),
+    open: q(`SELECT COUNT(*) n ${b} AND i.status='open'`).n,
+    overdue: q(`SELECT COUNT(*) n ${b} AND i.status='overdue'`).n,
+    collected: round2(q(`SELECT COALESCE(SUM(amount),0) v FROM payments pay JOIN accounts a ON a.id=pay.account_id WHERE a.org_id=?`).v),
+  };
+}
+
+// Aging buckets across unpaid invoices
+export function receivablesAging() {
+  refreshOverdue();
+  const rows = db.prepare(`SELECT i.*, (i.subtotal-i.amount_paid) balance, a.name account_name
+    FROM invoices i JOIN accounts a ON a.id=i.account_id
+    WHERE a.org_id=? AND i.status IN ('open','overdue') ORDER BY i.due_date`).all(ORG_ID);
+  const buckets = { current: 0, d30: 0, d60: 0, d90: 0 };
+  const today = todayISO();
+  for (const r of rows) {
+    const daysLate = Math.floor((new Date(today) - new Date(r.due_date)) / 86400000);
+    if (daysLate <= 0) buckets.current += r.balance;
+    else if (daysLate <= 30) buckets.d30 += r.balance;
+    else if (daysLate <= 60) buckets.d60 += r.balance;
+    else buckets.d90 += r.balance;
+  }
+  for (const k in buckets) buckets[k] = round2(buckets[k]);
+  return { buckets, invoices: rows };
+}
+
+export function listPaymentMethods(accountId) {
+  return db.prepare('SELECT * FROM payment_methods WHERE account_id=?').all(accountId);
+}
+
+// All properties with their account (for the estimate picker)
+export function listAllProperties() {
+  return db.prepare(`SELECT p.*, a.name AS account_name FROM properties p
+    JOIN accounts a ON a.id=p.account_id WHERE a.org_id=? ORDER BY a.name, p.address`).all(ORG_ID);
+}
+
+// ===========================================================================
+// PHASE 4 — Owner dashboard & notifications
+// ===========================================================================
+const usd = (n) => '$' + Number(n || 0).toFixed(2);
+
+// A notification stands in for a real email/SMS send. In production the same
+// hook would call an email/SMS provider; here it is logged to the activity feed.
+export function notify(type, { accountId = null, channel = 'email', title, body = null } = {}) {
+  db.prepare('INSERT INTO notifications (org_id,account_id,type,channel,title,body) VALUES (?,?,?,?,?,?)')
+    .run(ORG_ID, accountId, type, channel, title, body);
+}
+export function listNotifications(limit = 100) {
+  return db.prepare(`SELECT n.*, a.name AS account_name FROM notifications n
+    LEFT JOIN accounts a ON a.id=n.account_id WHERE n.org_id=?
+    ORDER BY n.created_at DESC, n.id DESC LIMIT ?`).all(ORG_ID, limit);
+}
+export function notificationStats() {
+  const q = (s) => db.prepare(s).get(ORG_ID).n;
+  const b = 'FROM notifications WHERE org_id=?';
+  return {
+    total: q(`SELECT COUNT(*) n ${b}`),
+    email: q(`SELECT COUNT(*) n ${b} AND channel='email'`),
+    sms: q(`SELECT COUNT(*) n ${b} AND channel='sms'`),
+    internal: q(`SELECT COUNT(*) n ${b} AND channel='internal'`),
+  };
+}
+
+export function revenueByMonth(year) {
+  const y = String(year);
+  const rows = (col, tbl, join) => db.prepare(`SELECT CAST(strftime('%m', ${col}) AS INTEGER) m, COALESCE(SUM(${tbl}),0) v
+    ${join} WHERE a.org_id=? AND strftime('%Y', ${col})=? GROUP BY m`).all(ORG_ID, y);
+  const paid = rows('applied_at', 'amount', 'FROM payments pay JOIN accounts a ON a.id=pay.account_id');
+  const bill = rows('issued_date', 'subtotal', 'FROM invoices i JOIN accounts a ON a.id=i.account_id');
+  const pm = new Map(paid.map(r => [r.m, r.v])), bm = new Map(bill.map(r => [r.m, r.v]));
+  const out = [];
+  for (let m = 1; m <= 12; m++) out.push({ month: m, collected: round2(pm.get(m) || 0), billed: round2(bm.get(m) || 0) });
+  return out;
+}
+
+export function ownerMetrics() {
+  refreshOverdue();
+  const yr = String(currentYear());
+  const g = (s, ...p) => db.prepare(s).get(...p);
+  const acc = 'FROM accounts WHERE org_id=?';
+  const inv = invoiceStats(), est = estimateStats(), sched = scheduleStats();
+  return {
+    collected: round2(g(`SELECT COALESCE(SUM(amount),0) v FROM payments pay JOIN accounts a ON a.id=pay.account_id WHERE a.org_id=? AND strftime('%Y',applied_at)=?`, ORG_ID, yr).v),
+    billed: round2(g(`SELECT COALESCE(SUM(subtotal),0) v FROM invoices i JOIN accounts a ON a.id=i.account_id WHERE a.org_id=? AND strftime('%Y',issued_date)=?`, ORG_ID, yr).v),
+    ar: inv.ar, overdue: inv.overdue,
+    active: g(`SELECT COUNT(*) n ${acc} AND status='active'`, ORG_ID).n,
+    prospects: g(`SELECT COUNT(*) n ${acc} AND status='prospect'`, ORG_ID).n,
+    cancelled: g(`SELECT COUNT(*) n ${acc} AND status='cancelled'`, ORG_ID).n,
+    activeSubs: g(`SELECT COUNT(*) n FROM subscriptions s JOIN properties p ON p.id=s.property_id JOIN accounts a ON a.id=p.account_id WHERE a.org_id=? AND s.status='active'`, ORG_ID).n,
+    renewals: g(`SELECT COUNT(*) n FROM subscriptions s JOIN properties p ON p.id=s.property_id JOIN accounts a ON a.id=p.account_id WHERE a.org_id=? AND s.status='active' AND s.auto_renew=1`, ORG_ID).n,
+    estSent: est.sent,
+    estValue: round2(g(`SELECT COALESCE(SUM(e.subtotal),0) v FROM estimates e JOIN properties p ON p.id=e.property_id JOIN accounts a ON a.id=p.account_id WHERE a.org_id=? AND e.status='sent'`, ORG_ID).v),
+    completed: sched.completed,
+    upcoming: g(`SELECT COUNT(*) n FROM visits v JOIN properties p ON p.id=v.property_id JOIN accounts a ON a.id=p.account_id WHERE a.org_id=? AND v.scheduled_date >= ? AND v.status!='completed'`, ORG_ID, todayISO()).n,
+    needs: sched.needs,
+  };
+}
+
+export function topReceivables(limit = 5) {
+  refreshOverdue();
+  return db.prepare(`SELECT id, name, balance FROM accounts WHERE org_id=? AND balance>0 ORDER BY balance DESC LIMIT ?`).all(ORG_ID, limit);
 }

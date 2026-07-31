@@ -63,6 +63,7 @@ const server = createServer(async (req, res) => {
       if (path === '/search') return send(res, 200, P.searchResults(query.q));
       if (path === '/pricebook') return send(res, 200, P.pricebook());
       if (path === '/notifications') return send(res, 200, P.notificationsPage());
+      if (path === '/reports') return send(res, 200, P.reportsPage());
       if (path === '/schedule') return send(res, 200, P.schedulePage(query));
       if (path === '/routes') return send(res, 200, P.routePage(query));
       if (path === '/field') return send(res, 200, P.fieldPage(query));

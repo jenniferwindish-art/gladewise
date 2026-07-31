@@ -45,6 +45,7 @@ const NAV = [
   { href: '/estimates', key: 'estimates', icon: '▧', label: 'Estimates' },
   { href: '/invoices', key: 'invoices', icon: '▨', label: 'Invoices' },
   { href: '/notifications', key: 'notifications', icon: '◔', label: 'Activity' },
+  { href: '/reports', key: 'reports', icon: '▥', label: 'Reports' },
   { href: '/pricebook', key: 'pricebook', icon: '☰', label: 'Price book' },
 ];
 

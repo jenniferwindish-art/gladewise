@@ -27,45 +27,128 @@ function activityRow(n) {
 }
 
 export function dashboard() {
-  const m = M.ownerMetrics();
-  const chart = buildRevenueChart(M.revenueByMonth(2026));
-  const feed = M.listNotifications(7);
-  const topAR = M.topReceivables(5);
+  const s = M.customerStats();
+  const recent = M.recentAccounts(6);
+  const followUps = M.listFollowUps(6);
+  const feed = M.listNotifications(6);
+  const sentEstimates = M.listEstimates('sent');
+  const routes = M.todaysRoutes();
+  const prospects = M.listAccounts({ status: 'prospect' }).slice(0, 6);
 
-  const collectRate = m.billed > 0 ? Math.round(m.collected / m.billed * 100) : 0;
+  const recentRows = recent.map(a => `<tr onclick="location='/accounts/${a.id}'">
+      <td class="td-strong">${esc(a.name)}</td>
+      <td>${badge(a.status)}</td>
+      <td>${esc(a.phone || '—')}</td>
+      <td class="ta-r">${num(a.property_count)}</td>
+    </tr>`).join('');
+
+  const followRows = followUps.map(f => `<div class="feed__item">
+      <span class="feed__icon feed__icon--service_complete">☎</span>
+      <div class="feed__body">
+        <div class="feed__title"><a class="link" href="/accounts/${f.account_id}">${esc(f.account_name)}</a></div>
+        <div class="feed__sub">${esc(f.note)}</div>
+      </div>
+      <div class="feed__meta"><span class="chan chan--sms">follow up</span><span class="feed__time">${fmtDate(f.follow_up_at)}</span></div>
+    </div>`).join('');
+  const estRows = sentEstimates.map(e => `<div class="feed__item">
+      <span class="feed__icon feed__icon--estimate_sent">✉</span>
+      <div class="feed__body">
+        <div class="feed__title"><a class="link" href="/estimates/${e.id}">${esc(e.account_name)} — Estimate #${e.id}</a></div>
+        <div class="feed__sub">Awaiting customer approval · ${money(e.subtotal)}</div>
+      </div>
+      <div class="feed__meta"><span class="feed__time">${fmtDate(e.created_at)}</span></div>
+    </div>`).join('');
+  const todoBlock = (followRows + estRows) || '<p class="muted">Nothing needs attention right now. 🎉</p>';
+
+  const routeCols = routes.crews.length ? routes.crews.map(c => `
+    <div class="routecol" style="--c:${esc(c.color || '#2f855a')}">
+      <div class="routecol__head">
+        <span class="routecol__name"><span class="dot" style="background:${esc(c.color || '#2f855a')}"></span>${esc(c.name)}</span>
+        <span class="routecol__meta">${c.stops.length} stop${c.stops.length === 1 ? '' : 's'} · <a class="link" href="/field?crew=${c.id}&date=${routes.date}">Field ›</a></span>
+      </div>
+      <ol class="routecol__stops">
+        ${c.stops.map(st => `<li>
+          <span class="rseq">${st.seq ?? '•'}</span>
+          <span class="rstop"><a class="link" href="/accounts/${st.account_id}">${esc(st.account_name)}</a>
+            <span class="sub">${esc(st.address)}${st.city ? ', ' + esc(st.city) : ''}</span></span>
+          ${st.status === 'completed' ? '<span class="badge badge--paid">done</span>' : ''}
+        </li>`).join('')}
+      </ol>
+    </div>`).join('') : '<p class="muted">No routes scheduled. Assign visits to a crew on the <a class="link" href="/schedule">Schedule</a> board.</p>';
+  const routeTitle = routes.isToday ? "Today's routes" : `Routes · ${fmtDate(routes.date)}`;
+  const routeMeta = routes.crews.length ? `${routes.crews.length} crew${routes.crews.length === 1 ? '' : 's'} out` : '';
+
+  const prospectRows = prospects.length ? prospects.map(p => `<tr onclick="location='/accounts/${p.id}'">
+      <td class="td-strong">${esc(p.name)}</td>
+      <td>${esc(p.phone || '—')}</td>
+      <td>${esc(p.source || '—')}</td>
+    </tr>`).join('') : '<tr><td colspan="3" class="empty">No prospects right now.</td></tr>';
 
   const body = `
-    ${pageHeader('Dashboard', `${esc(org()?.name || '')} · 2026 season`)}
+    ${pageHeader('Dashboard', `${esc(org()?.name || '')} · customers at a glance`)}
     <div class="grid grid--stats">
-      ${stat('Collected', money(m.collected), `${collectRate}% of ${money(m.billed)} billed`)}
-      ${stat('Accounts receivable', money(m.ar), `${num(m.overdue)} overdue`)}
-      ${stat('Active customers', num(m.active), `${num(m.prospects)} prospects`)}
-      ${stat('Visits completed', num(m.completed), `${num(m.upcoming)} upcoming`)}
+      ${stat('Active customers', num(s.active), `${num(s.total)} total · ${num(s.properties)} properties`)}
+      ${stat('Prospects', num(s.prospects), 'to convert')}
+      ${stat('Follow-ups due', num(s.followUps), 'from the call log')}
+      ${stat('Estimates out', num(s.estimatesSent), 'awaiting approval')}
     </div>
 
+    ${card(`<div class="card__head"><h2>${routeTitle}</h2><span class="muted">${routeMeta}</span></div>
+      <div class="routeboard">${routeCols}</div>`)}
+
     <div class="grid grid--wide">
-      ${card(`<div class="card__head"><h2>Revenue — 2026</h2><span class="legend">
-          <span class="legend__item"><span class="dot" style="background:var(--green-500)"></span>Collected</span>
-          <span class="legend__item"><span class="dot" style="background:#cfe0d6"></span>Billed</span></span></div>
-        ${chart}`)}
-      ${card(`<div class="card__head"><h2>Activity</h2><a class="link" href="/notifications">View all</a></div>
+      ${card(`<div class="card__head"><h2>Recent customers</h2><a class="link" href="/accounts">All customers ›</a></div>
+        <table class="table table--hover"><thead><tr><th>Name</th><th>Status</th><th>Phone</th><th class="ta-r">Properties</th></tr></thead>
+        <tbody>${recentRows}</tbody></table>`)}
+      ${card(`<div class="card__head"><h2>Recent activity</h2><a class="link" href="/notifications">View all</a></div>
         <div class="feed">${feed.length ? feed.map(activityRow).join('') : '<p class="muted">No activity yet.</p>'}</div>`)}
     </div>
 
     <div class="grid grid--2">
-      ${card(`<div class="card__head"><h2>Receivables</h2><a class="link" href="/invoices">Invoices ›</a></div>
-        ${topAR.length ? `<table class="table"><thead><tr><th>Customer</th><th class="ta-r">Balance</th></tr></thead>
-          <tbody>${topAR.map(a => `<tr onclick="location='/accounts/${a.id}'"><td class="td-strong">${esc(a.name)}</td><td class="ta-r owe">${money(a.balance)}</td></tr>`).join('')}</tbody></table>`
-          : '<p class="muted">Nothing outstanding — all paid up. 🎉</p>'}`)}
-      ${card(`<div class="card__head"><h2>Pipeline &amp; operations</h2></div>
-        <div class="kpis">
-          ${miniKpi('Estimates out', num(m.estSent), money(m.estValue) + ' value', '/estimates?status=sent')}
-          ${miniKpi('Active programs', num(m.activeSubs), num(m.renewals) + ' auto-renew', '/accounts?status=active')}
-          ${miniKpi('Needs scheduling', num(m.needs), 'awaiting a date', '/schedule')}
-          ${miniKpi('Upcoming visits', num(m.upcoming), 'on the calendar', '/routes')}
-        </div>`)}
-    </div>`;
+      ${card(`<div class="card__head"><h2>Follow-ups &amp; to-dos</h2></div>
+        <div class="feed">${todoBlock}</div>`)}
+      ${card(`<div class="card__head"><h2>Prospects to convert</h2><a class="link" href="/accounts?status=prospect">View all ›</a></div>
+        <table class="table table--hover"><thead><tr><th>Name</th><th>Phone</th><th>Source</th></tr></thead>
+        <tbody>${prospectRows}</tbody></table>`)}
+    </div>
+
+    <p class="muted dash-foot">Revenue, collections and receivables live in <a class="link" href="/reports">Reports</a>.</p>`;
   return layout({ title: 'Dashboard', active: 'dashboard', org: org(), body });
+}
+
+// ---- Reports (revenue & financials, moved off the dashboard) ---------------
+export function reportsPage() {
+  const m = M.ownerMetrics();
+  const chart = buildRevenueChart(M.revenueByMonth(2026));
+  const ag = M.receivablesAging();
+  const topAR = M.topReceivables(6);
+  const collectRate = m.billed > 0 ? Math.round(m.collected / m.billed * 100) : 0;
+  const body = `
+    ${pageHeader('Reports', `${esc(org()?.name || '')} · 2026 season`)}
+    <div class="grid grid--stats">
+      ${stat('Collected', money(m.collected), `${collectRate}% of billed`)}
+      ${stat('Billed', money(m.billed))}
+      ${stat('Accounts receivable', money(m.ar), `${num(m.overdue)} overdue`)}
+      ${stat('Active programs', num(m.activeSubs), `${num(m.renewals)} auto-renew`)}
+    </div>
+    ${card(`<div class="card__head"><h2>Revenue — 2026</h2><span class="legend">
+        <span class="legend__item"><span class="dot" style="background:var(--green-500)"></span>Collected</span>
+        <span class="legend__item"><span class="dot" style="background:#cfe0d6"></span>Billed</span></span></div>
+      ${chart}`)}
+    <div class="grid grid--2">
+      ${card(`<div class="card__head"><h2>Receivables aging</h2><a class="link" href="/invoices">Invoices ›</a></div>
+        <div class="aging">
+          ${agingTile('Current', ag.buckets.current)}
+          ${agingTile('1–30 days', ag.buckets.d30)}
+          ${agingTile('31–60 days', ag.buckets.d60)}
+          ${agingTile('60+ days', ag.buckets.d90, true)}
+        </div>`)}
+      ${card(`<div class="card__head"><h2>Top balances</h2></div>
+        ${topAR.length ? `<table class="table table--hover"><thead><tr><th>Customer</th><th class="ta-r">Balance</th></tr></thead>
+          <tbody>${topAR.map(a => `<tr onclick="location='/accounts/${a.id}'"><td class="td-strong">${esc(a.name)}</td><td class="ta-r owe">${money(a.balance)}</td></tr>`).join('')}</tbody></table>`
+          : '<p class="muted">Nothing outstanding.</p>'}`)}
+    </div>`;
+  return layout({ title: 'Reports', active: 'reports', org: org(), body });
 }
 
 function miniKpi(labelText, value, sub, href) {

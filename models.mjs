@@ -755,3 +755,79 @@ export function topReceivables(limit = 5) {
   refreshOverdue();
   return db.prepare(`SELECT id, name, balance FROM accounts WHERE org_id=? AND balance>0 ORDER BY balance DESC LIMIT ?`).all(ORG_ID, limit);
 }
+
+// ---- Customer-focused dashboard data --------------------------------------
+export function customerStats() {
+  const q = (s, ...p) => db.prepare(s).get(...p);
+  const acc = 'FROM accounts WHERE org_id=?';
+  return {
+    active: q(`SELECT COUNT(*) n ${acc} AND status='active'`, ORG_ID).n,
+    prospects: q(`SELECT COUNT(*) n ${acc} AND status='prospect'`, ORG_ID).n,
+    hold: q(`SELECT COUNT(*) n ${acc} AND status='hold'`, ORG_ID).n,
+    total: q(`SELECT COUNT(*) n ${acc}`, ORG_ID).n,
+    properties: q(`SELECT COUNT(*) n FROM properties p JOIN accounts a ON a.id=p.account_id WHERE a.org_id=?`, ORG_ID).n,
+    followUps: q(`SELECT COUNT(*) n FROM call_logs c JOIN accounts a ON a.id=c.account_id
+      WHERE a.org_id=? AND c.follow_up_at IS NOT NULL AND date(c.follow_up_at) >= date('now')`, ORG_ID).n,
+    estimatesSent: q(`SELECT COUNT(*) n FROM estimates e JOIN properties p ON p.id=e.property_id JOIN accounts a ON a.id=p.account_id
+      WHERE a.org_id=? AND e.status='sent'`, ORG_ID).n,
+  };
+}
+
+export function recentAccounts(limit = 6) {
+  return db.prepare(`SELECT a.*,
+      (SELECT COUNT(*) FROM properties p WHERE p.account_id=a.id) AS property_count,
+      (SELECT phone FROM contacts c WHERE c.account_id=a.id ORDER BY is_primary DESC LIMIT 1) AS phone
+    FROM accounts a WHERE a.org_id=? ORDER BY a.id DESC LIMIT ?`).all(ORG_ID, limit);
+}
+
+export function listFollowUps(limit = 8) {
+  return db.prepare(`SELECT c.*, a.name AS account_name FROM call_logs c
+    JOIN accounts a ON a.id=c.account_id
+    WHERE a.org_id=? AND c.follow_up_at IS NOT NULL AND date(c.follow_up_at) >= date('now')
+    ORDER BY c.follow_up_at LIMIT ?`).all(ORG_ID, limit);
+}
+
+export function upcomingVisits(limit = 8) {
+  return db.prepare(`SELECT v.*, p.address, p.city, a.name AS account_name, a.id AS account_id,
+      cr.name AS crew_name, cr.color AS crew_color
+    FROM visits v JOIN properties p ON p.id=v.property_id JOIN accounts a ON a.id=p.account_id
+    LEFT JOIN crews cr ON cr.id=v.crew_id
+    WHERE a.org_id=? AND v.scheduled_date >= date('now') AND v.status != 'completed'
+    ORDER BY v.scheduled_date, COALESCE(v.seq, 999) LIMIT ?`).all(ORG_ID, limit);
+}
+
+// Crews with their ordered stops for a given day (for the office "who's where" view)
+export function dayRoutes(date) {
+  const rows = db.prepare(`SELECT v.id, v.name, v.status, v.seq, v.scheduled_date,
+      p.address, p.city, a.name AS account_name, a.id AS account_id,
+      cr.id AS crew_id, cr.name AS crew_name, cr.color AS crew_color
+    FROM visits v JOIN properties p ON p.id=v.property_id JOIN accounts a ON a.id=p.account_id
+    JOIN crews cr ON cr.id=v.crew_id
+    WHERE a.org_id=? AND v.scheduled_date=? ORDER BY cr.name, COALESCE(v.seq, 999)`).all(ORG_ID, date);
+  const byCrew = new Map();
+  for (const r of rows) {
+    if (!byCrew.has(r.crew_id)) byCrew.set(r.crew_id, { id: r.crew_id, name: r.crew_name, color: r.crew_color, date, stops: [] });
+    byCrew.get(r.crew_id).stops.push(r);
+  }
+  return [...byCrew.values()];
+}
+
+// The most relevant route day: today if it has routes, else the next upcoming,
+// else the most recent past day — so the dashboard panel is never empty.
+export function relevantRouteDate() {
+  const today = todayISO();
+  const base = `FROM visits v JOIN properties p ON p.id=v.property_id JOIN accounts a ON a.id=p.account_id
+    WHERE a.org_id=? AND v.crew_id IS NOT NULL AND v.scheduled_date`;
+  const up = db.prepare(`SELECT MIN(v.scheduled_date) d ${base} >= ?`).get(ORG_ID, today).d;
+  if (up) return up;
+  const past = db.prepare(`SELECT MAX(v.scheduled_date) d ${base} < ?`).get(ORG_ID, today).d;
+  return past || today;
+}
+
+export function todaysRoutes() {
+  const today = todayISO();
+  const todayCrews = dayRoutes(today);
+  if (todayCrews.length) return { date: today, isToday: true, crews: todayCrews };
+  const date = relevantRouteDate();
+  return { date, isToday: date === today, crews: dayRoutes(date) };
+}

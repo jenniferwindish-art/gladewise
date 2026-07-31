@@ -127,7 +127,7 @@ function seed() {
   const techByCrew = (id) => (id === crewB ? 'Aisha' : 'Marcus');
   const completedDate = { 1: '2026-03-20', 2: '2026-05-06', 3: '2026-06-25' };
   const dueAfter = (d, n) => { const dt = new Date(d + 'T00:00:00'); dt.setDate(dt.getDate() + n); return dt.toISOString().slice(0, 10); };
-  const ROUTE_DAY = '2026-07-31'; // this week — a rich multi-stop day for Crew A
+  const ROUTE_DAY = isoInDays(0); // today — so the dashboard's "Today's routes" is populated
 
   for (const c of customers.filter(x => x.subId)) {
     const crewId = crewByCity(c.city);

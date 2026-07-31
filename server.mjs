@@ -3,10 +3,10 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, extname } from 'node:path';
-import { initSchema, tableCount } from './src/db.mjs';
-import { ensureSeed } from './src/seed.mjs';
-import * as P from './src/pages.mjs';
-import * as M from './src/models.mjs';
+import { initSchema, tableCount } from './db.mjs';
+import { ensureSeed } from './seed.mjs';
+import * as P from './pages.mjs';
+import * as M from './models.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
@@ -51,8 +51,8 @@ const server = createServer(async (req, res) => {
     const path = url.pathname;
     const query = Object.fromEntries(url.searchParams);
 
-    // Static assets
-    if (path.startsWith('/public/')) return serveStatic(res, path);
+    // Static assets (served from the project root)
+    if (path === '/styles.css' || path === '/app.js') return serveStatic(res, path);
     if (path === '/favicon.ico') return send(res, 204, '');
 
     // ---- GET routes ----
@@ -192,10 +192,10 @@ const server = createServer(async (req, res) => {
 
 async function serveStatic(res, path) {
   try {
-    const file = join(__dirname, path);
-    if (!file.startsWith(join(__dirname, 'public'))) return notFound(res);
-    const data = await readFile(file);
-    send(res, 200, data, MIME[extname(file)] || 'application/octet-stream');
+    const name = path.replace(/^\//, '');
+    if (name !== 'styles.css' && name !== 'app.js') return notFound(res);
+    const data = await readFile(join(__dirname, name));
+    send(res, 200, data, MIME[extname(name)] || 'application/octet-stream');
   } catch {
     notFound(res);
   }

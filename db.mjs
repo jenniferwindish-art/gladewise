@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const dataDir = join(__dirname, '..', 'data');
+const dataDir = join(__dirname, 'data');
 mkdirSync(dataDir, { recursive: true });
 
 const dbPath = process.env.BLADEWISE_DB || join(dataDir, 'bladewise.db');

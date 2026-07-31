@@ -61,7 +61,7 @@ export function layout({ title, active, body, org }) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} · Bladewise</title>
-<link rel="stylesheet" href="/public/styles.css">
+<link rel="stylesheet" href="/styles.css">
 </head>
 <body>
 <div class="app">
@@ -83,7 +83,7 @@ export function layout({ title, active, body, org }) {
     <div class="content">${body}</div>
   </main>
 </div>
-<script src="/public/app.js" defer></script>
+<script src="/app.js" defer></script>
 </body>
 </html>`;
 }
@@ -117,7 +117,7 @@ export function publicLayout({ title, body, org }) {
   return `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)}</title><link rel="stylesheet" href="/public/styles.css">
+<title>${esc(title)}</title><link rel="stylesheet" href="/styles.css">
 </head>
 <body class="public">
   <div class="pubwrap">

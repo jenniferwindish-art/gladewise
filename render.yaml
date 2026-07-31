@@ -1,3 +1,6 @@
+# Render deployment blueprint for Bladewise.
+# On render.com: New + → Blueprint → connect the repo containing this file.
+# Render auto-provides PORT and RENDER_EXTERNAL_URL (used for shareable links).
 services:
   - type: web
     name: bladewise
